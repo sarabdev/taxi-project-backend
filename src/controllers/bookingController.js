@@ -1,4 +1,8 @@
 const Booking = require("../models/Booking");
+const User = require("../models/User"); // adjust path if needed
+const Stripe = require("stripe");
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 /**
  * =========================================================
@@ -22,15 +26,31 @@ exports.createWebsiteBooking = async (req, res) => {
     const {
       fromAddress,
       toAddress,
-      pickupDateTime,
-      returnDateTime,
+
+      // ✅ NEW text-based fields
+      bookingDate,
+      bookingTime,
+      returnDate,
+      returnTime,
+
       numberOfPersons,
       luggage,
       carType,
+
       amount,
       currency,
       stripePaymentIntentId,
     } = req.body;
+
+    // --------------------------------
+    // Basic validation
+    // --------------------------------
+    if (!fromAddress || !toAddress || !bookingDate || !bookingTime) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required booking details",
+      });
+    }
 
     if (!stripePaymentIntentId) {
       return res.status(400).json({
@@ -39,14 +59,98 @@ exports.createWebsiteBooking = async (req, res) => {
       });
     }
 
+    /**
+     * ---------------------------------------------------------
+     * 🔐 VERIFY PAYMENT WITH STRIPE
+     * ---------------------------------------------------------
+     */
+    const intent = await stripe.paymentIntents.retrieve(stripePaymentIntentId, {
+      expand: ["charges"],
+    });
+
+    if (intent.status !== "succeeded") {
+      return res.status(400).json({
+        success: false,
+        message: "Payment not completed",
+      });
+    }
+
+    // Amount protection (GBP → pence)
+    const expectedAmount = Math.round(amount * 100);
+    if (intent.amount !== expectedAmount) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment amount mismatch",
+      });
+    }
+
+    /**
+     * ---------------------------------------------------------
+     * ❌ Prevent duplicate bookings for same payment
+     * ---------------------------------------------------------
+     */
+    const existingBooking = await Booking.findOne({
+      stripePaymentIntentId,
+    });
+
+    if (existingBooking) {
+      return res.status(400).json({
+        success: false,
+        message: "Booking already exists for this payment",
+      });
+    }
+
+    /**
+     * ---------------------------------------------------------
+     * 👤 CREATE / REUSE STRIPE CUSTOMER
+     * ---------------------------------------------------------
+     */
+    let stripeCustomerId = req.user.stripeCustomerId;
+
+    if (!stripeCustomerId) {
+      const customer = await stripe.customers.create({
+        email: req.user.email,
+        name: req.user.fullName,
+        metadata: {
+          userId: websiteUserId,
+        },
+      });
+
+      stripeCustomerId = customer.id;
+
+      await User.findByIdAndUpdate(websiteUserId, {
+        stripeCustomerId,
+      });
+    }
+
+    /**
+     * ---------------------------------------------------------
+     * 💳 EXTRACT CHARGE DETAILS
+     * ---------------------------------------------------------
+     */
+    const charge = intent.charges?.data?.[0] || null;
+
+    const stripeChargeId = charge?.id || null;
+    const stripeReceiptUrl = charge?.receipt_url || null;
+
+    /**
+     * ---------------------------------------------------------
+     * ✅ CREATE BOOKING (NO DATE PARSING)
+     * ---------------------------------------------------------
+     */
     const booking = await Booking.create({
       websiteUser: websiteUserId,
       source: "website",
 
       fromAddress,
       toAddress,
-      pickupDateTime,
-      returnDateTime,
+
+      // ✅ Store exactly as received
+      bookingDate,
+      bookingTime,
+      returnDate: returnDate || null,
+      returnTime: returnTime || null,
+
       numberOfPersons,
       luggage,
       carType,
@@ -56,7 +160,11 @@ exports.createWebsiteBooking = async (req, res) => {
 
       paymentMethod: "stripe",
       paymentStatus: "paid",
+
+      stripeCustomerId,
       stripePaymentIntentId,
+      stripeChargeId,
+      stripeReceiptUrl,
 
       status: "confirmed",
     });
@@ -84,8 +192,13 @@ exports.createWhatsappBooking = async (req, res) => {
     const {
       fromAddress,
       toAddress,
-      pickupDateTime,
-      returnDateTime,
+
+      // ✅ NEW text-based fields
+      bookingDate,
+      bookingTime,
+      returnDate,
+      returnTime,
+
       numberOfPersons,
       luggage,
       carType,
@@ -100,14 +213,29 @@ exports.createWhatsappBooking = async (req, res) => {
       });
     }
 
+    // --------------------------------
+    // Basic validation
+    // --------------------------------
+    if (!fromAddress || !toAddress || !bookingDate || !bookingTime) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required booking details",
+      });
+    }
+
     const booking = await Booking.create({
       user: whatsappUserId,
       source: "whatsapp",
 
       fromAddress,
       toAddress,
-      pickupDateTime,
-      returnDateTime,
+
+      // ✅ Store exactly as received (NO parsing)
+      bookingDate,
+      bookingTime,
+      returnDate: returnDate || null,
+      returnTime: returnTime || null,
+
       numberOfPersons,
       luggage,
       carType,
@@ -140,10 +268,7 @@ exports.getMyBookings = async (req, res) => {
     const websiteUserId = req.user?.id;
 
     const bookings = await Booking.find({
-      $or: [
-        { websiteUser: websiteUserId },
-        { user: websiteUserId },
-      ],
+      $or: [{ websiteUser: websiteUserId }, { user: websiteUserId }],
     })
       .sort({ createdAt: -1 })
       .populate("driver");
@@ -219,9 +344,7 @@ exports.cancelMyBooking = async (req, res) => {
     }
 
     // Only allow cancellation before driver assignment
-    if (
-      ["driver_assigned", "completed"].includes(booking.status)
-    ) {
+    if (["driver_assigned", "completed"].includes(booking.status)) {
       return res.status(400).json({
         success: false,
         message: "Booking cannot be cancelled at this stage",

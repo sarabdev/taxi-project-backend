@@ -49,14 +49,28 @@ const bookingSchema = new mongoose.Schema(
       required: true,
     },
 
-    pickupDateTime: {
-      type: Date,
+    bookingDate: {
+      type: String,
       required: true,
+      trim: true,
     },
 
-    returnDateTime: {
-      type: Date,
+    bookingTime: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+
+    returnDate: {
+      type: String,
       default: null,
+      trim: true,
+    },
+
+    returnTime: {
+      type: String,
+      default: null,
+      trim: true,
     },
 
     numberOfPersons: {
@@ -82,9 +96,9 @@ const bookingSchema = new mongoose.Schema(
     status: {
       type: String,
       enum: [
-        "draft",            // website (before payment)
-        "pending",          // whatsapp OR after vehicle selection
-        "confirmed",        // payment success / whatsapp confirm
+        "draft", // website (before payment)
+        "pending", // whatsapp OR after vehicle selection
+        "confirmed", // payment success / whatsapp confirm
         "driver_assigned",
         "cancelled",
         "completed",
@@ -137,9 +151,7 @@ bookingSchema.pre("validate", function (next) {
   // Website booking rules
   if (this.source === "website") {
     if (!this.websiteUser) {
-      return next(
-        new Error("websiteUser is required for website bookings")
-      );
+      return next(new Error("websiteUser is required for website bookings"));
     }
     this.paymentMethod = "stripe";
     this.status = this.status || "draft";
@@ -148,9 +160,7 @@ bookingSchema.pre("validate", function (next) {
   // WhatsApp booking rules
   if (this.source === "whatsapp") {
     if (!this.user) {
-      return next(
-        new Error("user is required for WhatsApp bookings")
-      );
+      return next(new Error("user is required for WhatsApp bookings"));
     }
     this.paymentMethod = this.paymentMethod || "cash";
   }

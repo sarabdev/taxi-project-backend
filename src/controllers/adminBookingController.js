@@ -5,14 +5,21 @@ const notificationService = require("../services/notificationService");
 exports.listBookings = async (req, res) => {
   try {
     const bookings = await Booking.find()
-      .populate("user")
+      .populate("user") // WhatsApp user
+      .populate("websiteUser") // Website user ✅
       .populate("driver")
       .sort({ createdAt: -1 });
 
-    res.json({ success: true, bookings });
+    res.json({
+      success: true,
+      bookings,
+    });
   } catch (err) {
     console.error("listBookings error:", err);
-    res.status(500).json({ success: false, message: "Server error" });
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+    });
   }
 };
 
