@@ -2,8 +2,13 @@ const express = require("express");
 const axios = require("axios");
 const userAuth = require("../middleware/userAuth");
 const quoteLimiter = require("../middleware/quoteLimiter");
+const AdminSettings = require("../models/AdminSettings");
 
 const router = express.Router();
+const getRatePerMile = async () => {
+  const settings = await AdminSettings.findOne().lean();
+  return settings?.perMilePrice ?? 0;
+};
 
 router.post("/calculate",userAuth,  async (req, res, next) => {
   try {
@@ -37,7 +42,7 @@ router.post("/calculate",userAuth,  async (req, res, next) => {
     const meters = element.distance.value;
     const miles = meters / 1609.34;
 
-    const RATE_PER_MILE = 2;
+    const RATE_PER_MILE = await getRatePerMile();
     const totalPrice = Number((miles * RATE_PER_MILE).toFixed(2));
 
     res.json({
@@ -94,7 +99,7 @@ router.post("/quote", quoteLimiter, async (req, res, next) => {
     const meters = element.distance.value;
     const miles = meters / 1609.34;
 
-    const RATE_PER_MILE = 2;
+    const RATE_PER_MILE = await getRatePerMile();
     const totalPrice = Number((miles * RATE_PER_MILE).toFixed(2));
 
     // ⚠️ LIMITED RESPONSE (important)

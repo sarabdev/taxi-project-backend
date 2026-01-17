@@ -1,401 +1,360 @@
 const ConversationState = require("../models/ConversationState");
+const Booking = require("../models/Booking");
+const User = require("../models/User");
+const mongoose = require("mongoose");
+
+const ProcessedMessage = mongoose.model("ProcessedMessage", new mongoose.Schema({
+  messageId: { type: String, unique: true },
+  createdAt: { type: Date, default: Date.now, expires: 86400 } 
+}));
+
 const { searchAddress } = require("../utils/addressSearch");
 const { parseDateTime } = require("../utils/dateParser");
 const whatsapp = require("../services/whatsappService");
-const {formatListRow} = require("../utils/whatsappFormat");
-exports.verifyWebhook = (req, res) => {
-  try {
-    const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
-
-    const mode = req.query["hub.mode"];
-    const token = req.query["hub.verify_token"];
-    const challenge = req.query["hub.challenge"];
-
-    if (mode && token) {
-      if (mode === "subscribe" && token === VERIFY_TOKEN) {
-        console.log("🚀 WhatsApp Webhook Verified Successfully!");
-        return res.status(200).send(challenge);
-      } else {
-        console.warn("❌ Invalid verify token");
-        return res.sendStatus(403);
-      }
-    }
-
-    return res.sendStatus(400);
-  } catch (err) {
-    console.error("Webhook verification error:", err);
-    return res.sendStatus(500);
-  }
-};
 
 const MAX_TITLE = 24;
 const MAX_DESC = 72;
+const INACTIVITY_MS = 30 * 60 * 1000;
 
-function formatRow(place, prefix) {
-  let title =
-    place.name ||
-    place.text.split(",")[0] ||
-    "Location";
+const CAR_TYPES = [
+  { value: "sedan", label: "Sedan" },
+  { value: "executive", label: "Executive" },
+  { value: "mpv", label: "MPV" },
+  { value: "suv", label: "SUV" },
+  { value: "van", label: "Van" },
+];
 
-  if (title.length > MAX_TITLE) {
-    title = title.slice(0, MAX_TITLE - 1) + "…";
+// =============================
+// DATETIME HELPER (Strict Format)
+// =============================
+function getFormattedDateTime(input) {
+  let dateObj = new Date();
+
+  if (input === "asap") { /* current */ }
+  else if (input === "15m") { dateObj.setMinutes(dateObj.getMinutes() + 15); }
+  else if (input === "30m") { dateObj.setMinutes(dateObj.getMinutes() + 30); }
+  else if (input === "1h") { dateObj.setHours(dateObj.getHours() + 1); }
+  else {
+    const parsed = parseDateTime(input);
+    if (parsed && parsed.date && parsed.time) {
+      return { date: parsed.date, time: parsed.time };
+    }
   }
 
-  let description = place.text;
-  if (description.length > MAX_DESC) {
-    description = description.slice(0, MAX_DESC - 1) + "…";
-  }
-
-  return {
-    id: `${prefix}_${place.id}`,
-    title,
-    description,
-  };
+  // Format: YYYY-MM-DD
+  const date = dateObj.toISOString().split('T')[0];
+  // Format: HH:mm
+  const time = dateObj.toTimeString().split(' ')[0].slice(0, 5);
+  
+  return { date, time };
 }
 
-exports.handleWebhook = async (req, res) => {
-  try {
-    const messageObj = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!messageObj) return res.sendStatus(200);
+// =============================
+// UTILS
+// =============================
+function truncate(text = "", max) {
+  return text.length <= max ? text : text.slice(0, max - 1) + "…";
+}
 
-    const from = messageObj.from;
-    const text = messageObj.text?.body;
-    const buttonId = messageObj?.interactive?.button_reply?.id;
-    const listId = messageObj?.interactive?.list_reply?.id;
-    const location = messageObj.location;
+async function safeSendInteractive(to, payload, fallbackText) {
+  try {
+    await whatsapp.sendInteractive(to, payload);
+  } catch (err) {
+    if (fallbackText) await whatsapp.sendText(to, fallbackText);
+  }
+}
+
+// =============================
+// WEBHOOK HANDLERS
+// =============================
+exports.verifyWebhook = (req, res) => {
+  const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+  if (req.query["hub.mode"] === "subscribe" && req.query["hub.verify_token"] === VERIFY_TOKEN) {
+    return res.status(200).send(req.query["hub.challenge"]);
+  }
+  return res.sendStatus(403);
+};
+
+exports.handleWebhook = async (req, res) => {
+  res.sendStatus(200);
+
+  try {
+    const entry = req.body.entry?.[0]?.changes?.[0]?.value;
+    const message = entry?.messages?.[0];
+    if (!message) return;
+
+    const from = message.from;
+    const msgId = message.id;
+
+    const alreadyProcessed = await ProcessedMessage.findOne({ messageId: msgId });
+    if (alreadyProcessed) return;
+    await ProcessedMessage.create({ messageId: msgId });
+
+    const text = message.text?.body?.trim();
+    const buttonId = message?.interactive?.button_reply?.id;
+    const listId = message?.interactive?.list_reply?.id;
+    const location = message.location;
 
     let convo = await ConversationState.findOne({ phone: from });
-    if (!convo) {
-      convo = await ConversationState.create({
-        phone: from,
-        step: "ASK_NAME",
-        temp: {},
-      });
+
+    if (!convo || (Date.now() - convo.updatedAt > INACTIVITY_MS)) {
+      convo = await ConversationState.findOneAndUpdate(
+        { phone: from },
+        { step: "START", temp: {}, updatedAt: new Date() },
+        { upsert: true, new: true }
+      );
     }
 
-    // -----------------------------
-    // RESET
-    // -----------------------------
-    if (text?.toLowerCase() === "book") {
+    if (text?.toLowerCase() === "book" || buttonId === "new_booking") {
       convo.step = "ASK_NAME";
       convo.temp = {};
       await convo.save();
-      await whatsapp.sendText(from, "Please tell us your name?");
-      return res.sendStatus(200);
+      return whatsapp.sendText(from, "Welcome! What is your name?");
     }
 
-    // -----------------------------
-    // STEP 1 — NAME
-    // -----------------------------
-    if (convo.step === "ASK_NAME") {
-      if (!text) return res.sendStatus(200);
-
-      convo.temp.name = text.trim();
-      convo.step = "ASK_PICKUP";
-      await convo.save();
-
-      await whatsapp.sendInteractive(from, {
-        type: "location_request_message",
-        body: {
-          text:
-            "Where would you like to be picked up?\n\n" +
-            "Send your location or type the address.\n" +
-            "Example: 10 High Street",
-        },
-        action: { name: "send_location" },
-      });
-
-      return res.sendStatus(200);
+    if (text?.toLowerCase() === "my bookings" || buttonId === "my_bookings") {
+      return sendBookingsList(from);
     }
 
-    // -----------------------------
-    // STEP 2 — PICKUP SEARCH
-    // -----------------------------
-    if (convo.step === "ASK_PICKUP") {
-      let query;
+    switch (convo.step) {
+      case "ASK_NAME":
+        if (!text) return;
+        convo.temp.name = text;
+        convo.step = "ASK_PICKUP";
+        await convo.save();
+        return safeSendInteractive(from, {
+          type: "location_request_message",
+          body: { text: `📍 Where should we pick you up, ${text}?` },
+          action: { name: "send_location" }
+        }, "📍 Please type your pickup address.");
 
-      if (location) {
-        query = `${location.latitude}, ${location.longitude}`;
-        convo.temp.pickupCoordinates = location;
-      } else if (text) {
-        query = text;
-      } else {
-        return res.sendStatus(200);
-      }
+      case "ASK_PICKUP":
+        const pQuery = location ? `${location.latitude},${location.longitude}` : text;
+        if (!pQuery) return;
+        const pResults = (await searchAddress(pQuery)).slice(0, 8);
+        if (pResults.length === 1) {
+          convo.temp.pickup = pResults[0].text;
+          convo.step = "ASK_DROPOFF";
+          await convo.save();
+          return whatsapp.sendText(from, "📍 Where are you going?");
+        }
+        convo.temp.pickupOptions = pResults;
+        convo.step = "PICKUP_CHOOSE";
+        await convo.save();
+        return sendLocationList(from, "Pickup Location", "pickup", pResults);
 
-      let results = (await searchAddress(query)).slice(0, 8);
-
-      if (results.length === 1) {
-        convo.temp.pickup = results[0].text;
-        convo.temp.pickupPlaceId = results[0].placeId;
+      case "PICKUP_CHOOSE":
+        if (!listId?.startsWith("pickup_")) return;
+        const pSelected = convo.temp.pickupOptions.find(o => o.id === listId.replace("pickup_", ""));
+        if (!pSelected) return;
+        convo.temp.pickup = pSelected.text;
         convo.step = "ASK_DROPOFF";
         await convo.save();
-        await whatsapp.sendText(from, "Where are you going?");
-        return res.sendStatus(200);
-      }
+        return whatsapp.sendText(from, "📍 Destination address?");
 
-      convo.temp.pickupOptions = results;
-      convo.step = "PICKUP_CHOOSE";
-      await convo.save();
+      case "ASK_DROPOFF":
+        if (!text) return;
+        const dResults = (await searchAddress(text)).slice(0, 8);
+        if (dResults.length === 1) {
+          convo.temp.dropoff = dResults[0].text;
+          convo.step = "ASK_DATETIME";
+          await convo.save();
+          return askTime(from);
+        }
+        convo.temp.dropoffOptions = dResults;
+        convo.step = "DROPOFF_CHOOSE";
+        await convo.save();
+        return sendLocationList(from, "Destination", "drop", dResults);
 
-      await whatsapp.sendInteractive(from, {
-        type: "list",
-        header: { type: "text", text: "Pickup Location" },
-        body: { text: "Multiple addresses found. Select one:" },
-        footer: { text: "Choose from the list" },
-        action: {
-          button: "Choose Pickup",
-          sections: [
-            {
-              title: "Pickup Options",
-              rows: results.map((r) => formatRow(r, "pickup")),
-            },
-          ],
-        },
-      });
-
-      return res.sendStatus(200);
-    }
-
-    // -----------------------------
-    // STEP 3 — PICKUP SELECT
-    // -----------------------------
-    if (convo.step === "PICKUP_CHOOSE" && listId?.startsWith("pickup_")) {
-      const id = listId.replace("pickup_", "");
-      const selected = convo.temp.pickupOptions.find((o) => o.id === id);
-
-      convo.temp.pickup = selected.text;
-      convo.temp.pickupPlaceId = selected.placeId;
-      convo.step = "ASK_DROPOFF";
-      await convo.save();
-
-      await whatsapp.sendText(from, "Please enter destination address:");
-      return res.sendStatus(200);
-    }
-
-    // -----------------------------
-    // STEP 4 — DROPOFF SEARCH
-    // -----------------------------
-    if (convo.step === "ASK_DROPOFF") {
-      if (!text) return res.sendStatus(200);
-
-      let results = (await searchAddress(text)).slice(0, 8);
-
-      if (results.length === 1) {
-        convo.temp.dropoff = results[0].text;
-        convo.temp.dropoffPlaceId = results[0].placeId;
+      case "DROPOFF_CHOOSE":
+        if (!listId?.startsWith("drop_")) return;
+        const dSelected = convo.temp.dropoffOptions.find(o => o.id === listId.replace("drop_", ""));
+        if (!dSelected) return;
+        convo.temp.dropoff = dSelected.text;
         convo.step = "ASK_DATETIME";
         await convo.save();
-        return askTimeOptions(from);
-      }
+        return askTime(from);
 
-      convo.temp.dropoffOptions = results;
-      convo.step = "DROPOFF_CHOOSE";
-      await convo.save();
+      case "ASK_DATETIME":
+        let dtInput = text;
+        if (listId?.startsWith("time_")) {
+          const map = { time_asap: "asap", time_15: "15m", time_30: "30m", time_60: "1h" };
+          dtInput = map[listId];
+        } else if (buttonId === "choose_time") {
+          return sendTimeList(from);
+        }
 
-      await whatsapp.sendInteractive(from, {
-        type: "list",
-        header: { type: "text", text: "Destination Location" },
-        body: { text: "Multiple addresses found. Select destination:" },
-        footer: { text: "Choose from the list" },
-        action: {
-          button: "Choose Destination",
-          sections: [
-            {
-              title: "Destination Options",
-              rows: results.map((r) => formatRow(r, "drop")),
-            },
-          ],
-        },
-      });
+        if (!dtInput) return;
 
-      return res.sendStatus(200);
-    }
-
-    // -----------------------------
-    // STEP 5 — DROPOFF SELECT
-    // -----------------------------
-    if (convo.step === "DROPOFF_CHOOSE" && listId?.startsWith("drop_")) {
-      const id = listId.replace("drop_", "");
-      const selected = convo.temp.dropoffOptions.find((o) => o.id === id);
-
-      convo.temp.dropoff = selected.text;
-      convo.temp.dropoffPlaceId = selected.placeId;
-      convo.step = "ASK_DATETIME";
-      await convo.save();
-
-      return askTimeOptions(from);
-    }
-
-    // -----------------------------
-    // STEP 6 — ASK DATETIME
-    // -----------------------------
-
-    // Button → open list
-    if (convo.step === "ASK_DATETIME" && buttonId === "choose_time") {
-      await whatsapp.sendInteractive(from, {
-        type: "list",
-        header: { type: "text", text: "Pickup Time" },
-        body: { text: "Please select a pickup time:" },
-        footer: { text: "Or type a custom time" },
-        action: {
-          button: "Choose Time",
-          sections: [
-            {
-              title: "Time Options",
-              rows: [
-                { id: "time_asap", title: "ASAP", description: "Pickup as soon as possible" },
-                { id: "time_15", title: "In 15 minutes", description: "Pickup after 15 minutes" },
-                { id: "time_30", title: "In 30 minutes", description: "Pickup after 30 minutes" },
-                { id: "time_60", title: "In 1 hour", description: "Pickup after 1 hour" },
-              ],
-            },
-          ],
-        },
-      });
-
-      return res.sendStatus(200);
-    }
-
-    // List selection
-    if (convo.step === "ASK_DATETIME" && listId?.startsWith("time_")) {
-      const mapping = {
-        time_asap: "ASAP",
-        time_15: "In 15 minutes",
-        time_30: "In 30 minutes",
-        time_60: "In 1 hour",
-      };
-
-      convo.temp.datetime = mapping[listId];
-      convo.step = "CONFIRM";
-      await convo.save();
-
-      return sendConfirmation(from, convo);
-    }
-
-    // Typed time
-    if (convo.step === "ASK_DATETIME" && text) {
-      const parsed = parseDateTime(text);
-      convo.temp.datetime = parsed.formatted;
-      convo.step = "CONFIRM";
-      await convo.save();
-
-      return sendConfirmation(from, convo);
-    }
-
-    // -----------------------------
-    // STEP 7 — CONFIRM
-    // -----------------------------
-    if (convo.step === "CONFIRM") {
-      if (buttonId === "edit_booking") {
-        convo.step = "ASK_NAME";
-        convo.temp = {};
+        const { date, time } = getFormattedDateTime(dtInput);
+        
+        // Use Mongoose .set() to ensure nested fields are marked as modified
+        convo.temp.datetime = `${date} ${time}`; // Fallback legacy field if needed
+        convo.set('temp.bookingDate', date);
+        convo.set('temp.bookingTime', time);
+        convo.step = "ASK_VEHICLE";
         await convo.save();
-        await whatsapp.sendText(from, "Let's start again. What is your name?");
-      }
+        return sendVehicleList(from);
 
-      if (buttonId === "confirm_booking") {
-  const User = require("../models/User");
-  const Booking = require("../models/Booking");
+      case "ASK_VEHICLE":
+        if (!listId?.startsWith("car_")) return sendVehicleList(from);
+        const selectedCar = listId.replace("car_", "");
+        convo.set('temp.carType', selectedCar);
+        convo.step = "CONFIRM";
+        await convo.save();
+        return sendConfirmation(from, convo);
 
-  // 1️⃣ Create or find user
-  let user = await User.findOne({ phone: from });
-  if (!user) {
-    user = await User.create({
-      phone: from,
-      name: convo.temp.name,
-    });
-  }
+      case "CONFIRM":
+        if (buttonId === "confirm_booking") {
+          let user = await User.findOne({ phone: from }) || await User.create({ phone: from, name: convo.temp.name });
 
-  // 2️⃣ Parse datetime
-  const pickupDateTime = new Date(convo.temp.datetime);
+          // THE FIX: Creating the object explicitly to ensure no values are undefined
+          const bookingData = {
+            user: user._id,
+            source: "whatsapp",
+            fromAddress: convo.temp.pickup,
+            toAddress: convo.temp.dropoff,
+            bookingDate: convo.temp.bookingDate || new Date().toISOString().split('T')[0],
+            bookingTime: convo.temp.bookingTime || "ASAP",
+            carType: convo.temp.carType || "sedan",
+            status: "confirmed",
+            paymentMethod: "cash"
+          };
 
-  // 3️⃣ Create booking
-  const booking = await Booking.create({
-    user: user._id,
-    source: "whatsapp",
-    fromAddress: convo.temp.pickup,
-    toAddress: convo.temp.dropoff,
-    pickupDateTime,
-    numberOfPersons: 1,
-    carType: "Taxi",
-    paymentMethod: "whatsapp",
-    paymentStatus: "unpaid",
-    status: "confirmed",
-  });
+          await Booking.create(bookingData);
 
-  // 4️⃣ Reset conversation
-  convo.step = "DONE";
-  convo.temp = {};
-  await convo.save();
+          convo.step = "DONE";
+          convo.temp = {};
+          await convo.save();
+          return sendPostBookingMenu(from);
+        }
+        return sendConfirmation(from, convo);
 
-  // 5️⃣ Confirm on WhatsApp
-  await whatsapp.sendText(
-    from,
-    `🎉 *Booking Confirmed!*\n\n` +
-      `📍 Pickup: ${booking.fromAddress}\n` +
-      `📍 Drop-off: ${booking.toAddress}\n` +
-      `🕒 Time: ${pickupDateTime.toLocaleString()}\n\n` +
-      `Our team will assign a driver shortly.`
-  );
-
-  return res.sendStatus(200);
-}
-
-    }
-
-    return res.sendStatus(200);
-
-    // -----------------------------
-    // HELPERS
-    // -----------------------------
-    function askTimeOptions(to) {
-      return whatsapp.sendInteractive(to, {
-        type: "button",
-        body: {
-          text:
-            "When should we pick you up?\n\n" +
-            "Tap below to choose a time or type a specific time.\n" +
-            "Example: tomorrow 10am",
-        },
-        action: {
-          buttons: [
-            {
-              type: "reply",
-              reply: { id: "choose_time", title: "Choose Time" },
-            },
-          ],
-        },
-      });
-    }
-
-    function sendConfirmation(to, convo) {
-      const msg =
-        `OK looks like we are ready for booking!\n\n` +
-        `☑ Name: ${convo.temp.name}\n` +
-        `☑ Pickup: ${convo.temp.pickup}\n` +
-        `☑ Drop Off: ${convo.temp.dropoff}\n` +
-        `☑ When: ${convo.temp.datetime}\n` +
-        `☑ Vehicle: Taxi (1–6 Max)\n` +
-        `☑ Notes: No notes given\n` +
-        `🕐 Waiting Time: 6 minutes\n\n` +
-        `If incorrect, tap Edit. Otherwise tap Book.`;
-
-      return whatsapp.sendInteractive(to, {
-        type: "button",
-        body: { text: msg },
-        action: {
-          buttons: [
-            { type: "reply", reply: { id: "edit_booking", title: "Edit" } },
-            { type: "reply", reply: { id: "confirm_booking", title: "Book" } },
-          ],
-        },
-      });
+      default:
+        return sendMainMenu(from);
     }
   } catch (err) {
-    console.error("Webhook error:", err);
-    return res.sendStatus(500);
+    console.error("🔥 Error Detail:", err);
   }
 };
 
+// =============================
+// UI HELPERS
+// =============================
 
+async function sendMainMenu(to) {
+  return safeSendInteractive(to, {
+    type: "button",
+    body: { text: "Welcome! How can we help you today?" },
+    action: {
+      buttons: [
+        { type: "reply", reply: { id: "new_booking", title: "Book a Ride" } },
+        { id: "my_bookings", title: "My Bookings" }
+      ]
+    }
+  });
+}
+
+function sendVehicleList(to) {
+  return safeSendInteractive(to, {
+    type: "list",
+    body: { text: "Select your car type:" },
+    action: {
+      button: "Choose Car",
+      sections: [{
+        title: "Fleet Options",
+        rows: CAR_TYPES.map(c => ({ id: `car_${c.value}`, title: c.label }))
+      }]
+    }
+  });
+}
+
+function askTime(to) {
+  return safeSendInteractive(to, {
+    type: "button",
+    body: { text: "🕒 When is the pickup?\n\nSelect a quick option or type (e.g. 'tomorrow 10am')" },
+    action: {
+      buttons: [{ type: "reply", reply: { id: "choose_time", title: "Quick Options" } }]
+    }
+  });
+}
+
+function sendTimeList(to) {
+  return safeSendInteractive(to, {
+    type: "list",
+    body: { text: "Select a pickup window:" },
+    action: {
+      button: "Select",
+      sections: [{
+        title: "Options",
+        rows: [
+          { id: "time_asap", title: "ASAP" },
+          { id: "time_15", title: "In 15 mins" },
+          { id: "time_30", title: "In 30 mins" },
+          { id: "time_60", title: "In 1 hour" }
+        ]
+      }]
+    }
+  });
+}
+
+function sendLocationList(to, title, prefix, results) {
+  return safeSendInteractive(to, {
+    type: "list",
+    header: { type: "text", text: title },
+    body: { text: "Please select the best match:" },
+    action: {
+      button: "Select",
+      sections: [{
+        title: "Results",
+        rows: results.map(r => ({
+          id: `${prefix}_${r.id}`,
+          title: truncate(r.name || r.text.split(",")[0], MAX_TITLE),
+          description: truncate(r.text, MAX_DESC)
+        }))
+      }]
+    }
+  });
+}
+
+async function sendConfirmation(to, convo) {
+  const date = convo.temp.bookingDate || "Today";
+  const time = convo.temp.bookingTime || "ASAP";
+  const car = (convo.temp.carType || "sedan").toUpperCase();
+
+  const msg = `📋 *Booking Summary*\n\n📍 From: ${convo.temp.pickup}\n🏁 To: ${convo.temp.dropoff}\n📅 Date: ${date}\n🕒 Time: ${time}\n🚗 Car: ${car}`;
+  
+  return safeSendInteractive(to, {
+    type: "button",
+    body: { text: msg },
+    action: {
+      buttons: [{ type: "reply", reply: { id: "confirm_booking", title: "Confirm & Book" } }]
+    }
+  }, msg);
+}
+
+async function sendPostBookingMenu(to) {
+  return safeSendInteractive(to, {
+    type: "button",
+    body: { text: "✅ Booking Confirmed! We are looking for your driver." },
+    action: {
+      buttons: [
+        { type: "reply", reply: { id: "new_booking", title: "Book Another" } },
+        { type: "reply", reply: { id: "my_bookings", title: "View All" } }
+      ]
+    }
+  });
+}
+
+async function sendBookingsList(to) {
+  const user = await User.findOne({ phone: to });
+  if (!user) return whatsapp.sendText(to, "No history found.");
+  const list = await Booking.find({ user: user._id }).sort({ createdAt: -1 }).limit(3);
+  if (!list.length) return whatsapp.sendText(to, "You have no bookings.");
+
+  let text = "📋 *Last 3 Bookings:*\n\n";
+  list.forEach((b, i) => {
+    text += `${i+1}. ${truncate(b.toAddress, 25)}\n📅 ${b.bookingDate} at ${b.bookingTime}\n\n`;
+  });
+  return whatsapp.sendText(to, text);
+}

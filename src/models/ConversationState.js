@@ -15,6 +15,7 @@ const conversationStateSchema = new mongoose.Schema(
         "ASK_DATETIME",
         "CONFIRM",
         "DONE",
+        "ASK_VEHICLE"
       ],
       default: "ASK_NAME",
     },
@@ -29,6 +30,8 @@ const conversationStateSchema = new mongoose.Schema(
 
       datetime: String,
       notes: String,
+      lastMessageId: { type: String }
+
     },
   },
   { timestamps: true }

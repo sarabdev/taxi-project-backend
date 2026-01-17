@@ -3,6 +3,7 @@ const router = express.Router();
 
 const adminController = require("../controllers/adminController");
 const bookingController = require("../controllers/adminBookingController");
+const adminSettingsController = require("../controllers/adminSettingsController");
 const adminAuth = require("../middleware/adminAuth");
 
 // -----------------------------
@@ -57,4 +58,16 @@ router.patch(
   }
 );
 
+router.get(
+  "/settings",
+  adminAuth,
+  adminSettingsController.getSettings
+);
+
+// Save / update admin settings
+router.post(
+  "/settings",
+  adminAuth,
+  adminSettingsController.saveSettings
+);
 module.exports = router;
