@@ -81,14 +81,23 @@ exports.handleWebhook = async (req, res) => {
   try {
     const entry = req.body.entry?.[0]?.changes?.[0]?.value;
     const message = entry?.messages?.[0];
-    if (!message) return;
-
+    if (
+      !message ||
+      (
+        !message.text &&
+        !message.interactive &&
+        !message.location
+      )
+    ) {
+      return;
+    }
     const from = message.from;
     const msgId = message.id;
 
-    const alreadyProcessed = await ProcessedMessage.findOne({ messageId: msgId });
-    if (alreadyProcessed) return;
-    await ProcessedMessage.create({ messageId: msgId });
+    // const alreadyProcessed = await ProcessedMessage.findOne({ messageId: msgId });
+    // if (alreadyProcessed) return;
+    // await ProcessedMessage.create({ messageId: msgId });
+    
 
     const text = message.text?.body?.trim();
     const buttonId = message?.interactive?.button_reply?.id;
@@ -97,7 +106,7 @@ exports.handleWebhook = async (req, res) => {
 
     let convo = await ConversationState.findOne({ phone: from });
 
-    if (!convo || (Date.now() - convo.updatedAt > INACTIVITY_MS)) {
+    if (!convo) {
       convo = await ConversationState.findOneAndUpdate(
         { phone: from },
         { step: "START", temp: {}, updatedAt: new Date() },
