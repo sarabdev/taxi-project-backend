@@ -4,7 +4,7 @@ const router = express.Router();
 const userAuth = require("../middleware/userAuth");
 const controller = require("../controllers/bookingController");
 
-router.post("/website", userAuth, controller.createWebsiteBooking);
+router.post("/website", controller.createWebsiteBooking);
 router.post("/whatsapp", userAuth, controller.createWhatsappBooking);
 
 router.get("/me", userAuth, controller.getMyBookings);

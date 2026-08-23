@@ -18,6 +18,10 @@ const bookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    customerName: { type: String, trim: true, default: null },
+    customerEmail: { type: String, trim: true, lowercase: true, default: null },
+    customerPhone: { type: String, trim: true, default: null },
+
     // ----------------------------------
     // BOOKING SOURCE
     // ----------------------------------
@@ -140,6 +144,9 @@ const bookingSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    stripeCustomerId: { type: String, default: null },
+    stripeChargeId: { type: String, default: null },
+    stripeReceiptUrl: { type: String, default: null },
   },
   { timestamps: true }
 );
@@ -150,8 +157,8 @@ const bookingSchema = new mongoose.Schema(
 bookingSchema.pre("validate", function (next) {
   // Website booking rules
   if (this.source === "website") {
-    if (!this.websiteUser) {
-      return next(new Error("websiteUser is required for website bookings"));
+    if (!this.websiteUser && (!this.customerName || !this.customerEmail || !this.customerPhone)) {
+      return next(new Error("Customer contact details are required for website bookings"));
     }
     this.paymentMethod = "stripe";
     this.status = this.status || "draft";

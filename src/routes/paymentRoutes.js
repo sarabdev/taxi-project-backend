@@ -1,7 +1,5 @@
 const express = require("express");
 const Stripe = require("stripe");
-const User = require("../models/User");
-const userAuth = require("../middleware/userAuth");
 
 const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -11,43 +9,14 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
  * CREATE PAYMENT INTENT (ONE-TIME PAYMENT)
  * =========================================================
  */
-router.post("/create-intent", userAuth, async (req, res) => {
+router.post("/create-intent", async (req, res) => {
   try {
-    const { amount, bookingId, currency } = req.body;
-    const userId = req.user?.id;
-
-    if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: "Unauthorized",
-      });
-    }
+    const { amount, bookingId, currency, customerEmail, customerName } = req.body;
 
     if (!amount || amount <= 0) {
       return res.status(400).json({
         success: false,
         message: "Invalid amount",
-      });
-    }
-
-    /**
-     * ---------------------------------------------------------
-     * 👤 CREATE / REUSE STRIPE CUSTOMER
-     * ---------------------------------------------------------
-     */
-    let stripeCustomerId = req.user.stripeCustomerId;
-
-    if (!stripeCustomerId) {
-      const customer = await stripe.customers.create({
-        email: req.user.email,
-        name: req.user.fullName,
-        metadata: { userId },
-      });
-
-      stripeCustomerId = customer.id;
-
-      await User.findByIdAndUpdate(userId, {
-        stripeCustomerId,
       });
     }
 
@@ -60,7 +29,7 @@ router.post("/create-intent", userAuth, async (req, res) => {
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amount * 100), // GBP → pence
       currency: currency?.toLowerCase() || "gbp",
-      customer: stripeCustomerId,
+      ...(customerEmail ? { receipt_email: customerEmail } : {}),
 
       automatic_payment_methods: {
         enabled: true,
@@ -68,7 +37,8 @@ router.post("/create-intent", userAuth, async (req, res) => {
 
       metadata: {
         bookingId: bookingId || "draft",
-        userId,
+        customerEmail: customerEmail || "",
+        customerName: customerName || "",
       },
     });
 
@@ -117,7 +87,7 @@ router.post(
 
           console.log("✅ Payment succeeded (webhook)", {
             paymentIntentId: intent.id,
-            userId: intent.metadata?.userId,
+            customerEmail: intent.metadata?.customerEmail,
             bookingId: intent.metadata?.bookingId,
             amount: intent.amount,
           });

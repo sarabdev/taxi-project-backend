@@ -1,5 +1,5 @@
 const Booking = require("../models/Booking");
-const User = require("../models/User"); // adjust path if needed
+const notificationService = require("../services/notificationService");
 const Stripe = require("stripe");
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -14,18 +14,12 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
  */
 exports.createWebsiteBooking = async (req, res) => {
   try {
-    const websiteUserId = req.user?.id;
-
-    if (!websiteUserId) {
-      return res.status(401).json({
-        success: false,
-        message: "Unauthorized",
-      });
-    }
-
     const {
       fromAddress,
       toAddress,
+      customerName,
+      customerEmail,
+      customerPhone,
 
       // ✅ NEW text-based fields
       bookingDate,
@@ -45,7 +39,7 @@ exports.createWebsiteBooking = async (req, res) => {
     // --------------------------------
     // Basic validation
     // --------------------------------
-    if (!fromAddress || !toAddress || !bookingDate || !bookingTime) {
+    if (!fromAddress || !toAddress || !bookingDate || !bookingTime || !customerName || !customerEmail || !customerPhone) {
       return res.status(400).json({
         success: false,
         message: "Missing required booking details",
@@ -102,29 +96,6 @@ exports.createWebsiteBooking = async (req, res) => {
 
     /**
      * ---------------------------------------------------------
-     * 👤 CREATE / REUSE STRIPE CUSTOMER
-     * ---------------------------------------------------------
-     */
-    let stripeCustomerId = req.user.stripeCustomerId;
-
-    if (!stripeCustomerId) {
-      const customer = await stripe.customers.create({
-        email: req.user.email,
-        name: req.user.fullName,
-        metadata: {
-          userId: websiteUserId,
-        },
-      });
-
-      stripeCustomerId = customer.id;
-
-      await User.findByIdAndUpdate(websiteUserId, {
-        stripeCustomerId,
-      });
-    }
-
-    /**
-     * ---------------------------------------------------------
      * 💳 EXTRACT CHARGE DETAILS
      * ---------------------------------------------------------
      */
@@ -139,8 +110,10 @@ exports.createWebsiteBooking = async (req, res) => {
      * ---------------------------------------------------------
      */
     const booking = await Booking.create({
-      websiteUser: websiteUserId,
       source: "website",
+      customerName,
+      customerEmail,
+      customerPhone,
 
       fromAddress,
       toAddress,
@@ -161,13 +134,15 @@ exports.createWebsiteBooking = async (req, res) => {
       paymentMethod: "stripe",
       paymentStatus: "paid",
 
-      stripeCustomerId,
+      stripeCustomerId: intent.customer || null,
       stripePaymentIntentId,
       stripeChargeId,
       stripeReceiptUrl,
 
       status: "confirmed",
     });
+
+    await notificationService.sendBookingConfirmation(booking);
 
     return res.status(201).json({
       success: true,

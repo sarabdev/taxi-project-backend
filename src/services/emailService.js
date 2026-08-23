@@ -6,10 +6,12 @@ let transporter;
 function getTransporter() {
   if (transporter) return transporter;
 
+  const port = Number(process.env.EMAIL_PORT || 587);
+
   transporter = nodemailer.createTransport({
     host: process.env.EMAIL_HOST,
-    port: Number(process.env.EMAIL_PORT || 587),
-    secure: false, // true for 465, false for other ports
+    port,
+    secure: process.env.EMAIL_SECURE === "true" || port === 465,
     auth: {
       user: process.env.EMAIL_USER,
       pass: process.env.EMAIL_PASS,
@@ -38,10 +40,12 @@ exports.sendMail = async ({ to, subject, text, html }) => {
     };
 
     const transporter = getTransporter();
-    await transporter.sendMail(mailOptions);
+    const info = await transporter.sendMail(mailOptions);
 
     console.log(`📧 Email sent to ${to}`);
+    return { ok: true, messageId: info.messageId };
   } catch (err) {
     console.error("emailService.sendMail error:", err);
+    return { ok: false, message: err.message };
   }
 };

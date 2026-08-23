@@ -5,9 +5,9 @@ const notificationService = require("../services/notificationService");
 exports.listBookings = async (req, res) => {
   try {
     const bookings = await Booking.find()
-      .populate("user") // WhatsApp user
-      .populate("websiteUser") // Website user ✅
-      .populate("driver")
+      .populate("user", "name phone email whatsappId createdAt")
+      .populate("websiteUser", "fullName email phone isActive createdAt")
+      .populate("driver", "name phone carModel carNumber isActive notes")
       .sort({ createdAt: -1 });
 
     res.json({
